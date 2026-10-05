@@ -1,6 +1,26 @@
 import { ChannelTypeEnum, IAttachmentOptions } from '../template/template.interface';
 import { ChannelData } from './channel-data.type';
-import { CheckIntegrationResponseEnum } from './provider.enum';
+import { CheckIntegrationResponseEnum, WebhookSignatureStatusEnum } from './provider.enum';
+
+/**
+ * Result returned by a provider's `verifySignature`. `status` is optional for
+ * backwards compatibility; handlers normalize it (see BaseHandler.verifySignature).
+ */
+export interface IProviderWebhookSignatureResult {
+  success: boolean;
+  status?: WebhookSignatureStatusEnum;
+  message?: string;
+}
+
+/**
+ * Normalized result returned by channel handlers to the inbound webhook route.
+ * Invariant: `success === true` if and only if `status === WebhookSignatureStatusEnum.VERIFIED`.
+ */
+export interface IWebhookSignatureVerificationResult {
+  success: boolean;
+  status: WebhookSignatureStatusEnum;
+  message?: string;
+}
 
 export interface IProvider {
   id: string;
@@ -9,7 +29,7 @@ export interface IProvider {
     rawBody: unknown;
     headers?: Record<string, string>;
     body?: Record<string, unknown>;
-  }) => Promise<{ success: boolean; message?: string }>;
+  }) => Promise<IProviderWebhookSignatureResult>;
   autoConfigureInboundWebhook?: (configurations: { webhookUrl: string }) => Promise<{
     success: boolean;
     message?: string;
