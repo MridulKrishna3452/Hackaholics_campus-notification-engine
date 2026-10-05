@@ -1,5 +1,11 @@
 import { ChannelTypeEnum, IConfigurations } from '@novu/shared';
-import { ChannelProvider, IEmailEventBody, ISMSEventBody } from '@novu/stateless';
+import {
+  ChannelProvider,
+  IEmailEventBody,
+  ISMSEventBody,
+  IWebhookSignatureVerificationResult,
+  WebhookSignatureStatusEnum,
+} from '@novu/stateless';
 
 export interface IHandler {
   inboundWebhookEnabled(): boolean;
@@ -12,6 +18,10 @@ export interface IHandler {
     eventIndex?: number
   ) => IEmailEventBody | ISMSEventBody | undefined;
 
+  /**
+   * Fail-closed: resolves `success: true` only when the provider positively verified the
+   * request signature (`status === VERIFIED`). Never throws.
+   */
   verifySignature: ({
     body,
     headers,
@@ -20,7 +30,7 @@ export interface IHandler {
     body: Record<string, unknown>;
     headers: Record<string, string>;
     rawBody: unknown;
-  }) => Promise<{ success: boolean; message?: string }>;
+  }) => Promise<IWebhookSignatureVerificationResult>;
 
   autoConfigureInboundWebhook: (configurations: { webhookUrl: string }) => Promise<{
     success: boolean;
@@ -81,13 +91,27 @@ export abstract class BaseHandler<T extends ChannelProvider = ChannelProvider> i
     rawBody: unknown;
     headers?: Record<string, string>;
     body?: Record<string, unknown>;
-  }): Promise<{ success: boolean; message?: string }> {
+  }): Promise<IWebhookSignatureVerificationResult> {
     if (!this.provider?.verifySignature) {
-      // in case verifySignature is not implemented, we return true
-      return { success: true, message: 'A support of signature verification is not implemented by provider' };
+      // Fail closed: a provider without a verifier can never produce a trusted webhook
+      return {
+        success: false,
+        status: WebhookSignatureStatusEnum.UNSUPPORTED,
+        message: 'Signature verification is not supported by this provider',
+      };
     }
 
-    return this.provider.verifySignature({ rawBody, headers, body });
+    try {
+      const result = await this.provider.verifySignature({ rawBody, headers, body });
+
+      return normalizeWebhookSignatureResult(result);
+    } catch (error) {
+      return {
+        success: false,
+        status: WebhookSignatureStatusEnum.ERROR,
+        message: `Error verifying signature: ${error instanceof Error ? error.message : 'Unknown error'}`,
+      };
+    }
   }
 
   public async autoConfigureInboundWebhook(configurations: { webhookUrl: string }): Promise<{
@@ -105,4 +129,39 @@ export abstract class BaseHandler<T extends ChannelProvider = ChannelProvider> i
 
     return this.provider.autoConfigureInboundWebhook(configurations);
   }
+}
+
+/**
+ * Enforces the `IWebhookSignatureVerificationResult` invariant on whatever a provider returned:
+ * only an explicit `success: true` without a contradicting status maps to VERIFIED.
+ */
+export function normalizeWebhookSignatureResult(result: unknown): IWebhookSignatureVerificationResult {
+  if (!result || typeof result !== 'object' || typeof (result as { success?: unknown }).success !== 'boolean') {
+    return {
+      success: false,
+      status: WebhookSignatureStatusEnum.ERROR,
+      message: 'Provider returned an invalid signature verification result',
+    };
+  }
+
+  const { success, status, message } = result as {
+    success: boolean;
+    status?: WebhookSignatureStatusEnum;
+    message?: string;
+  };
+
+  if (success && (status === undefined || status === WebhookSignatureStatusEnum.VERIFIED)) {
+    return { success: true, status: WebhookSignatureStatusEnum.VERIFIED, message };
+  }
+
+  const isKnownFailureStatus =
+    status !== undefined &&
+    status !== WebhookSignatureStatusEnum.VERIFIED &&
+    Object.values(WebhookSignatureStatusEnum).includes(status);
+
+  return {
+    success: false,
+    status: isKnownFailureStatus ? status : WebhookSignatureStatusEnum.INVALID,
+    message,
+  };
 }
