@@ -1,5 +1,5 @@
 import { createHmac } from 'node:crypto';
-import { ENDPOINT_TYPES, IChatOptions } from '@novu/stateless';
+import { ENDPOINT_TYPES, IChatOptions, WebhookSignatureStatusEnum } from '@novu/stateless';
 import axios from 'axios';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import {
@@ -330,11 +330,12 @@ test('verifySignature accepts a valid Spectrum v0 signature and rejects a tamper
   expect(tampered.success).toBe(false);
 });
 
-test('verifySignature passes when no signing key is configured', async () => {
+test('verifySignature fails closed when no signing key is configured', async () => {
   const provider = new PhotonImessageChatProvider(mockProviderConfig);
 
   const result = await provider.verifySignature({ rawBody: '{}', headers: {} });
-  expect(result.success).toBe(true);
+  expect(result.success).toBe(false);
+  expect(result.status).toBe(WebhookSignatureStatusEnum.NOT_CONFIGURED);
 });
 
 test('getMessageId correlates read receipts and outbound echoes, skips inbound texts', () => {

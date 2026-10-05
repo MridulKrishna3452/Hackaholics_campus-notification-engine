@@ -8,6 +8,7 @@ import {
   IChatRenderResult,
   ISendMessageSuccessResponse,
   isChannelDataOfType,
+  WebhookSignatureStatusEnum,
 } from '@novu/stateless';
 import Axios, { AxiosError, AxiosInstance } from 'axios';
 import { BaseProvider, CasingEnum } from '../../../base.provider';
@@ -505,8 +506,8 @@ export class PhotonImessageChatProvider extends BaseProvider implements IChatPro
    * `X-Spectrum-Timestamp` header (unix seconds, 300s replay tolerance) —
    * mirrors `@spectrum-ts/core`'s own `verifySpectrumSignature`. Spectrum does
    * not sign with Standard Webhooks yet (future Spectrum refactor). Mirrors
-   * other providers' behavior when no signing key is configured: pass, so
-   * manual setups without a stored secret keep working.
+   * other providers' behavior when no signing key is configured: fail closed,
+   * so a manual setup must store the signing secret before events are trusted.
    */
   async verifySignature({
     rawBody,
@@ -518,7 +519,11 @@ export class PhotonImessageChatProvider extends BaseProvider implements IChatPro
   }): Promise<{ success: boolean; message?: string }> {
     const signingKey = this.config.webhookSigningKey?.trim();
     if (!signingKey) {
-      return { success: true, message: 'Webhook signing key not configured; skipping signature verification' };
+      return {
+        success: false,
+        status: WebhookSignatureStatusEnum.NOT_CONFIGURED,
+        message: 'Webhook signing key not configured; rejecting unverified webhook',
+      };
     }
 
     const bodyString = typeof rawBody === 'string' ? rawBody : (rawBody as Buffer | undefined)?.toString('utf8');

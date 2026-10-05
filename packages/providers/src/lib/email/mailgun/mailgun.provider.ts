@@ -8,6 +8,7 @@ import {
   IEmailOptions,
   IEmailProvider,
   ISendMessageSuccessResponse,
+  WebhookSignatureStatusEnum,
 } from '@novu/stateless';
 import { createHmac } from 'crypto';
 import formData from 'form-data';
@@ -253,7 +254,8 @@ export class MailgunEmailProvider extends BaseProvider implements IEmailProvider
 
       if (!webhookSigningKey) {
         return {
-          success: true,
+          success: false,
+          status: WebhookSignatureStatusEnum.NOT_CONFIGURED,
           message: 'Mailgun signature verification is not configured',
         };
       }

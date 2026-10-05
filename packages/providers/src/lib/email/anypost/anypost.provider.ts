@@ -9,6 +9,7 @@ import {
   IEmailOptions,
   IEmailProvider,
   ISendMessageSuccessResponse,
+  WebhookSignatureStatusEnum,
 } from '@novu/stateless';
 import type { Attachment, EmailSendRequest, WebhookDeliveryEvent, WebhookEventType } from 'anypost';
 import { Anypost, verifyWebhookSignature } from 'anypost';
@@ -186,7 +187,11 @@ export class AnypostEmailProvider extends BaseProvider implements IEmailProvider
     const webhookSigningKey = this.config.webhookSigningKey;
 
     if (!webhookSigningKey) {
-      return { success: true, message: 'Anypost signature verification is not configured' };
+      return {
+        success: false,
+        status: WebhookSignatureStatusEnum.NOT_CONFIGURED,
+        message: 'Anypost signature verification is not configured',
+      };
     }
 
     if (!signature) {

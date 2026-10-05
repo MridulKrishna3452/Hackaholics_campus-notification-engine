@@ -8,6 +8,7 @@ import {
   IEmailOptions,
   IEmailProvider,
   ISendMessageSuccessResponse,
+  WebhookSignatureStatusEnum,
 } from '@novu/stateless';
 import { CreateEmailOptions, Resend } from 'resend';
 import { Webhook } from 'svix';
@@ -210,7 +211,8 @@ export class ResendEmailProvider extends BaseProvider implements IEmailProvider 
 
       if (!webhookSigningKey) {
         return {
-          success: true,
+          success: false,
+          status: WebhookSignatureStatusEnum.NOT_CONFIGURED,
           message: 'Resend signature verification is not configured',
         };
       }
