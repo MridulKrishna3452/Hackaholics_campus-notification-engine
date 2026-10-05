@@ -1,0 +1,606 @@
+import { Injectable } from '@nestjs/common';
+import { DirectionEnum } from '@novu/shared';
+import { type ClientSession, FilterQuery, Types } from 'mongoose';
+import { EnforceEnvOrOrgIds } from '../../types';
+import { SortOrder } from '../../types/sort-order';
+import { BaseRepositoryV2 } from '../base-repository-v2';
+import {
+  ActivityView,
+  compileActivityViewMatch,
+  viewFoldsRevisions,
+  viewUsesSequencePagination,
+} from './activity-views';
+import {
+  ConversationActivityDBModel,
+  ConversationActivityEntity,
+  ConversationActivitySenderTypeEnum,
+  ConversationActivitySignalData,
+  ConversationActivityToolData,
+  ConversationActivityTypeEnum,
+  type RunLifecycleActivityType,
+} from './conversation-activity.entity';
+import { ConversationActivity } from './conversation-activity.schema';
+import { foldMessageRevisions } from './message-revisions';
+
+const LIST_ACTIVITIES_SORT_FIELDS = ['_id', 'createdAt'] as const;
+type ListActivitiesSortField = (typeof LIST_ACTIVITIES_SORT_FIELDS)[number];
+
+function resolveListActivitiesSortBy(sortBy?: string): ListActivitiesSortField {
+  if (sortBy && (LIST_ACTIVITIES_SORT_FIELDS as readonly string[]).includes(sortBy)) {
+    return sortBy as ListActivitiesSortField;
+  }
+
+  return 'createdAt';
+}
+
+@Injectable()
+export class ConversationActivityRepository extends BaseRepositoryV2<
+  ConversationActivityDBModel,
+  ConversationActivityEntity,
+  EnforceEnvOrOrgIds
+> {
+  constructor() {
+    super(ConversationActivity, ConversationActivityEntity);
+  }
+
+  async findByConversation(
+    environmentId: string,
+    conversationId: string,
+    limit = 20
+  ): Promise<ConversationActivityEntity[]> {
+    return this.find({ _environmentId: environmentId, _conversationId: conversationId }, '*', {
+      sort: { createdAt: -1 },
+      limit,
+    });
+  }
+
+  async listForView(params: {
+    view: ActivityView;
+    environmentId: string;
+    organizationId: string;
+    conversationId: string;
+    limit: number;
+    /** Sequence cursor toward older history — only for `client_events`. */
+    before?: string;
+  }): Promise<{ data: ConversationActivityEntity[]; hasMore: boolean }> {
+    const viewMatch = compileActivityViewMatch(params.view);
+
+    if (viewUsesSequencePagination(params.view)) {
+      const query: FilterQuery<ConversationActivityDBModel> & EnforceEnvOrOrgIds = {
+        _environmentId: params.environmentId,
+        _organizationId: params.organizationId,
+        _conversationId: params.conversationId,
+        sequence: { $type: 'number' },
+        ...viewMatch,
+      };
+
+      if (params.before) {
+        const cursor = await this.findOne(
+          {
+            _environmentId: params.environmentId,
+            _organizationId: params.organizationId,
+            _conversationId: params.conversationId,
+            _id: params.before,
+          },
+          '*'
+        );
+
+        if (!cursor || typeof cursor.sequence !== 'number') {
+          return { data: [], hasMore: false };
+        }
+
+        query.$and = [
+          {
+            $or: [{ sequence: { $lt: cursor.sequence } }, { sequence: cursor.sequence, _id: { $lt: cursor._id } }],
+          },
+        ];
+      }
+
+      const fetchLimit = params.limit + 1;
+      const data = await this.find(query, '*', {
+        sort: { sequence: -1, _id: -1 },
+        limit: fetchLimit,
+      });
+
+      return {
+        data: data.slice(0, params.limit),
+        hasMore: data.length > params.limit,
+      };
+    }
+
+    const data = await this.find(
+      {
+        _environmentId: params.environmentId,
+        _organizationId: params.organizationId,
+        _conversationId: params.conversationId,
+        ...viewMatch,
+      },
+      '*',
+      {
+        sort: { createdAt: -1 },
+        limit: params.limit,
+      }
+    );
+
+    if (!viewFoldsRevisions(params.view)) {
+      return { data, hasMore: false };
+    }
+
+    let folded = await this.foldViewPage(params, data);
+    if (folded.length < params.limit && data.length === params.limit) {
+      const refill = await this.find(
+        {
+          _environmentId: params.environmentId,
+          _organizationId: params.organizationId,
+          _conversationId: params.conversationId,
+          ...viewMatch,
+        },
+        '*',
+        {
+          sort: { createdAt: -1 },
+          limit: params.limit * 2,
+        }
+      );
+      folded = (await this.foldViewPage(params, refill)).slice(0, params.limit);
+    }
+
+    return { data: folded, hasMore: false };
+  }
+
+  async findMessageRevisions(
+    environmentId: string,
+    conversationId: string,
+    platformMessageIds: string[]
+  ): Promise<ConversationActivityEntity[]> {
+    const ids = [...new Set(platformMessageIds.filter(Boolean))];
+    if (ids.length === 0) {
+      return [];
+    }
+
+    return this.find(
+      {
+        _environmentId: environmentId,
+        _conversationId: conversationId,
+        platformMessageId: { $in: ids },
+        type: { $in: [ConversationActivityTypeEnum.EDIT, ConversationActivityTypeEnum.DELETE] },
+      },
+      '*'
+    );
+  }
+
+  private async foldViewPage(
+    params: { environmentId: string; conversationId: string },
+    data: ConversationActivityEntity[]
+  ): Promise<ConversationActivityEntity[]> {
+    const revisions = await this.findMessageRevisions(
+      params.environmentId,
+      params.conversationId,
+      data.map((row) => row.platformMessageId).filter((id): id is string => Boolean(id))
+    );
+
+    if (revisions.length === 0) {
+      return data;
+    }
+
+    return foldMessageRevisions(data, revisions);
+  }
+
+  /** Resolves the activity for a specific platform-native message id (e.g. the message a reaction targets). */
+  async findByPlatformMessageId(
+    environmentId: string,
+    conversationId: string,
+    platformMessageId: string
+  ): Promise<ConversationActivityEntity | null> {
+    return this.findOne(
+      {
+        _environmentId: environmentId,
+        _conversationId: conversationId,
+        platformMessageId,
+        type: ConversationActivityTypeEnum.MESSAGE,
+      },
+      '*'
+    );
+  }
+
+  async findExistingPlatformMessageIds(
+    environmentId: string,
+    conversationId: string,
+    platformMessageIds: string[]
+  ): Promise<Set<string>> {
+    if (platformMessageIds.length === 0) {
+      return new Set();
+    }
+
+    const activities = await this.find(
+      {
+        _environmentId: environmentId,
+        _conversationId: conversationId,
+        platformMessageId: { $in: platformMessageIds },
+      },
+      ['platformMessageId']
+    );
+
+    return new Set(activities.flatMap((activity) => (activity.platformMessageId ? [activity.platformMessageId] : [])));
+  }
+
+  async countAgentMessages(environmentId: string, conversationId: string): Promise<number> {
+    return this.count({
+      _environmentId: environmentId,
+      _conversationId: conversationId,
+      senderType: ConversationActivitySenderTypeEnum.AGENT,
+      type: ConversationActivityTypeEnum.MESSAGE,
+    });
+  }
+
+  async countActivities(environmentId: string, organizationId: string, conversationId: string): Promise<number> {
+    return this.count({
+      _environmentId: environmentId,
+      _organizationId: organizationId,
+      _conversationId: conversationId,
+    });
+  }
+
+  /**
+   * Repoint SUBSCRIBER-authored activities from `fromSubscriberId` to
+   * `toSubscriberId` (both external `subscriberId` strings, stored in
+   * `senderId`). Used by the email adoption merge so past timeline entries stay
+   * attributed to the surviving identity. Returns the number of activities
+   * updated.
+   */
+  async repointSubscriberSender(params: {
+    environmentId: string;
+    organizationId: string;
+    fromSubscriberId: string;
+    toSubscriberId: string;
+  }): Promise<number> {
+    const result = await this.update(
+      {
+        _environmentId: params.environmentId,
+        _organizationId: params.organizationId,
+        senderType: ConversationActivitySenderTypeEnum.SUBSCRIBER,
+        senderId: params.fromSubscriberId,
+      },
+      { $set: { senderId: params.toSubscriberId } }
+    );
+
+    return result.modified;
+  }
+
+  async createUserActivity(params: {
+    identifier: string;
+    conversationId: string;
+    platform: string;
+    integrationId: string;
+    platformThreadId: string;
+    senderType: ConversationActivitySenderTypeEnum;
+    senderId: string;
+    content: string;
+    richContent?: Record<string, unknown>;
+    platformMessageId?: string;
+    senderName?: string;
+    sequence?: number;
+    type?: ConversationActivityTypeEnum;
+    environmentId: string;
+    organizationId: string;
+  }): Promise<ConversationActivityEntity> {
+    return this.create({
+      identifier: params.identifier,
+      _conversationId: params.conversationId,
+      type: params.type ?? ConversationActivityTypeEnum.MESSAGE,
+      platform: params.platform,
+      _integrationId: params.integrationId,
+      platformThreadId: params.platformThreadId,
+      senderType: params.senderType,
+      senderId: params.senderId,
+      content: params.content,
+      richContent: params.richContent,
+      platformMessageId: params.platformMessageId,
+      senderName: params.senderName,
+      ...(params.sequence !== undefined ? { sequence: params.sequence } : {}),
+      _environmentId: params.environmentId,
+      _organizationId: params.organizationId,
+    });
+  }
+
+  async importUserActivities(
+    params: {
+      conversationId: string;
+      platform: string;
+      integrationId: string;
+      platformThreadId: string;
+      messages: Array<{
+        identifier: string;
+        senderId: string;
+        senderName?: string;
+        content: string;
+        platformMessageId: string;
+        sequence: number;
+      }>;
+      environmentId: string;
+      organizationId: string;
+    },
+    session?: ClientSession | null
+  ): Promise<number> {
+    const firstCreatedAt = Date.now() - params.messages.length;
+    const conversationId = new Types.ObjectId(params.conversationId);
+    const integrationId = new Types.ObjectId(params.integrationId);
+    const environmentId = new Types.ObjectId(params.environmentId);
+    const organizationId = new Types.ObjectId(params.organizationId);
+    const operations = params.messages.map((message, index) => ({
+      updateOne: {
+        filter: {
+          _environmentId: environmentId,
+          identifier: message.identifier,
+        },
+        update: {
+          $setOnInsert: {
+            identifier: message.identifier,
+            _conversationId: conversationId,
+            type: ConversationActivityTypeEnum.MESSAGE,
+            platform: params.platform,
+            _integrationId: integrationId,
+            platformThreadId: params.platformThreadId,
+            senderType: ConversationActivitySenderTypeEnum.PLATFORM_USER,
+            senderId: message.senderId,
+            senderName: message.senderName,
+            content: message.content,
+            platformMessageId: message.platformMessageId,
+            sequence: message.sequence,
+            _environmentId: environmentId,
+            _organizationId: organizationId,
+            createdAt: new Date(firstCreatedAt + index),
+          },
+        },
+        upsert: true,
+      },
+    }));
+
+    const result = await this.MongooseModel.bulkWrite(operations, {
+      ordered: true,
+      ...(session ? { session } : {}),
+    });
+
+    return result.upsertedCount;
+  }
+
+  async createAgentActivity(params: {
+    identifier: string;
+    conversationId: string;
+    platform: string;
+    integrationId: string;
+    platformThreadId: string;
+    agentId: string;
+    content: string;
+    richContent?: Record<string, unknown>;
+    toolData?: ConversationActivityToolData;
+    type?: ConversationActivityTypeEnum;
+    senderName?: string;
+    platformMessageId?: string;
+    sequence?: number;
+    environmentId: string;
+    organizationId: string;
+    session?: ClientSession | null;
+  }): Promise<ConversationActivityEntity> {
+    const type = params.type ?? ConversationActivityTypeEnum.MESSAGE;
+
+    return this.create(
+      {
+        identifier: params.identifier,
+        _conversationId: params.conversationId,
+        type,
+        platform: params.platform,
+        _integrationId: params.integrationId,
+        platformThreadId: params.platformThreadId,
+        senderType: ConversationActivitySenderTypeEnum.AGENT,
+        senderId: params.agentId,
+        content: params.content,
+        richContent: params.richContent,
+        toolData: params.toolData,
+        senderName: params.senderName,
+        ...(params.platformMessageId !== undefined ? { platformMessageId: params.platformMessageId } : {}),
+        ...(params.sequence !== undefined ? { sequence: params.sequence } : {}),
+        _environmentId: params.environmentId,
+        _organizationId: params.organizationId,
+      },
+      params.session ? { session: params.session } : {}
+    );
+  }
+
+  async createSignalActivity(params: {
+    identifier: string;
+    conversationId: string;
+    platform: string;
+    integrationId: string;
+    platformThreadId: string;
+    agentId: string;
+    content: string;
+    signalData: ConversationActivitySignalData;
+    platformMessageId?: string;
+    environmentId: string;
+    organizationId: string;
+  }): Promise<ConversationActivityEntity> {
+    return this.create({
+      identifier: params.identifier,
+      _conversationId: params.conversationId,
+      type: ConversationActivityTypeEnum.SIGNAL,
+      platform: params.platform,
+      _integrationId: params.integrationId,
+      platformThreadId: params.platformThreadId,
+      senderType: ConversationActivitySenderTypeEnum.SYSTEM,
+      senderId: params.agentId,
+      content: params.content,
+      signalData: params.signalData,
+      platformMessageId: params.platformMessageId,
+      _environmentId: params.environmentId,
+      _organizationId: params.organizationId,
+    });
+  }
+
+  async createToolActivity(params: {
+    identifier: string;
+    conversationId: string;
+    platform: string;
+    integrationId: string;
+    platformThreadId: string;
+    senderType: ConversationActivitySenderTypeEnum;
+    senderId: string;
+    senderName?: string;
+    content: string;
+    type: ConversationActivityTypeEnum;
+    toolData: ConversationActivityToolData;
+    richContent?: Record<string, unknown>;
+    sequence?: number;
+    environmentId: string;
+    organizationId: string;
+    platformMessageId?: string;
+  }): Promise<ConversationActivityEntity> {
+    return this.create({
+      identifier: params.identifier,
+      _conversationId: params.conversationId,
+      type: params.type,
+      platform: params.platform,
+      _integrationId: params.integrationId,
+      platformThreadId: params.platformThreadId,
+      senderType: params.senderType,
+      senderId: params.senderId,
+      senderName: params.senderName,
+      content: params.content,
+      toolData: params.toolData,
+      ...(params.richContent !== undefined ? { richContent: params.richContent } : {}),
+      ...(params.platformMessageId !== undefined ? { platformMessageId: params.platformMessageId } : {}),
+      ...(params.sequence !== undefined ? { sequence: params.sequence } : {}),
+      _environmentId: params.environmentId,
+      _organizationId: params.organizationId,
+    });
+  }
+
+  async createRunActivity(params: {
+    identifier: string;
+    conversationId: string;
+    platform: string;
+    integrationId: string;
+    platformThreadId: string;
+    senderId: string;
+    content: string;
+    type: RunLifecycleActivityType;
+    richContent?: Record<string, unknown>;
+    sequence?: number;
+    environmentId: string;
+    organizationId: string;
+  }): Promise<ConversationActivityEntity> {
+    return this.create({
+      identifier: params.identifier,
+      _conversationId: params.conversationId,
+      type: params.type,
+      platform: params.platform,
+      _integrationId: params.integrationId,
+      platformThreadId: params.platformThreadId,
+      senderType: ConversationActivitySenderTypeEnum.AGENT,
+      senderId: params.senderId,
+      content: params.content,
+      ...(params.richContent !== undefined ? { richContent: params.richContent } : {}),
+      ...(params.sequence !== undefined ? { sequence: params.sequence } : {}),
+      _environmentId: params.environmentId,
+      _organizationId: params.organizationId,
+    });
+  }
+
+  async findToolActivitiesByPlanMessageId(
+    environmentId: string,
+    conversationId: string,
+    planMessageId: string
+  ): Promise<ConversationActivityEntity[]> {
+    return this.find(
+      {
+        _environmentId: environmentId,
+        _conversationId: conversationId,
+        type: ConversationActivityTypeEnum.SIGNAL,
+        'signalData.type': 'tool-use',
+        'signalData.payload.planMessageId': planMessageId,
+      } as FilterQuery<ConversationActivityDBModel> & EnforceEnvOrOrgIds,
+      '*',
+      { sort: { createdAt: 1 } }
+    );
+  }
+
+  async listActivities({
+    organizationId,
+    environmentId,
+    conversationId,
+    limit = 20,
+    after,
+    before,
+    sortBy = 'createdAt',
+    sortDirection = 1,
+    includeCursor = false,
+    view,
+  }: {
+    organizationId: string;
+    environmentId: string;
+    conversationId: string;
+    limit?: number;
+    after?: string;
+    before?: string;
+    sortBy?: string;
+    sortDirection?: SortOrder;
+    includeCursor?: boolean;
+    view?: ActivityView;
+  }): Promise<{
+    data: ConversationActivityEntity[];
+    next: string | null;
+    previous: string | null;
+    totalCount: number;
+    totalCountCapped: boolean;
+  }> {
+    if (before && after) {
+      throw new Error('Cannot specify both "before" and "after" cursors at the same time.');
+    }
+
+    const validatedSortBy = resolveListActivitiesSortBy(sortBy);
+
+    let activity: ConversationActivityEntity | null = null;
+    const id = before || after;
+
+    if (id) {
+      activity = await this.findOne(
+        {
+          _environmentId: environmentId,
+          _organizationId: organizationId,
+          _conversationId: conversationId,
+          _id: id,
+        },
+        '*'
+      );
+
+      if (!activity) {
+        return { data: [], next: null, previous: null, totalCount: 0, totalCountCapped: false };
+      }
+    }
+
+    const afterCursor =
+      after && activity ? { sortBy: activity[validatedSortBy], paginateField: activity._id } : undefined;
+    const beforeCursor =
+      before && activity ? { sortBy: activity[validatedSortBy], paginateField: activity._id } : undefined;
+
+    const query: FilterQuery<ConversationActivityDBModel> & EnforceEnvOrOrgIds = {
+      _environmentId: environmentId,
+      _organizationId: organizationId,
+      _conversationId: conversationId,
+      ...(view ? compileActivityViewMatch(view) : {}),
+    };
+
+    const pagination = await this.findWithCursorBasedPagination({
+      after: afterCursor,
+      before: beforeCursor,
+      paginateField: '_id',
+      limit,
+      sortDirection: sortDirection === 1 ? DirectionEnum.ASC : DirectionEnum.DESC,
+      sortBy: validatedSortBy,
+      includeCursor,
+      query,
+      select: '*',
+    });
+
+    return pagination;
+  }
+}
