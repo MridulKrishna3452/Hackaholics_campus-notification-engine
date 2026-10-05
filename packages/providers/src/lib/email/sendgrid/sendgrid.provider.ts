@@ -7,7 +7,9 @@ import {
   ICheckIntegrationResponse,
   IEmailEventBody,
   IEmailProvider,
+  IProviderWebhookSignatureResult,
   ISendMessageSuccessResponse,
+  WebhookSignatureStatusEnum,
 } from '@novu/stateless';
 import { Client } from '@sendgrid/client';
 // cspell:disable-next-line
@@ -187,40 +189,66 @@ export class SendgridEmailProvider extends BaseProvider implements IEmailProvide
     return [(body as any).id];
   }
 
+  /**
+   * Verifies a SendGrid Signed Event Webhook request (fail-closed).
+   * SendGrid signs `timestamp + rawBody` with ECDSA (P-256 / SHA-256) and sends the base64 signature and
+   * timestamp in the `X-Twilio-Email-Event-Webhook-Signature` / `X-Twilio-Email-Event-Webhook-Timestamp`
+   * headers. The verification key is the public key SendGrid returns when signing is enabled, stored in
+   * `configurations.inboundWebhookSigningKey`. `rawBody` must be the exact bytes received.
+   */
   async verifySignature({
     rawBody,
     headers = {},
     body: _body,
   }: {
-    rawBody: any;
+    rawBody: unknown;
     headers?: Record<string, string>;
     body?: Record<string, unknown>;
-  }): Promise<{ success: boolean; message?: string }> {
+  }): Promise<IProviderWebhookSignatureResult> {
+    const publicKey = this.config.webhookPublicKey?.trim();
+
+    if (!publicKey) {
+      return {
+        success: false,
+        status: WebhookSignatureStatusEnum.NOT_CONFIGURED,
+        message: 'SendGrid webhook verification key is not configured',
+      };
+    }
+
+    const signature = this.getHeaderValue(headers, 'x-twilio-email-event-webhook-signature');
+    const timestamp = this.getHeaderValue(headers, 'x-twilio-email-event-webhook-timestamp');
+
+    if (!signature || !timestamp) {
+      return {
+        success: false,
+        status: WebhookSignatureStatusEnum.MISSING_SIGNATURE,
+        message: 'Missing SendGrid signature headers',
+      };
+    }
+
+    // A re-serialized JSON body would not match the signed bytes, so only the raw payload is accepted
+    if (typeof rawBody !== 'string' && !Buffer.isBuffer(rawBody)) {
+      return {
+        success: false,
+        status: WebhookSignatureStatusEnum.ERROR,
+        message: 'Raw request body is unavailable for signature verification',
+      };
+    }
+
     try {
-      const signature = this.getHeaderValue(headers, 'x-twilio-email-event-webhook-signature');
-      const timestamp = this.getHeaderValue(headers, 'x-twilio-email-event-webhook-timestamp');
-      const isSignatureVerificationEnabled = signature && timestamp;
-
-      if (!isSignatureVerificationEnabled) {
-        return { success: true, message: 'SendGrid signature verification is disabled for this request' };
-      }
-      const publicKey = this.config.webhookPublicKey;
-
-      if (!publicKey || rawBody === undefined) {
-        const message = [!publicKey ? 'Public key is undefined' : '', !rawBody ? 'Body is undefined' : '']
-          .filter(Boolean)
-          .join(',');
-        return { success: false, message };
-      }
-
       const eventWebhook = new EventWebhook();
       const ecdsaPublicKey = eventWebhook.convertPublicKeyToECDSA(publicKey);
+      const isValid = eventWebhook.verifySignature(ecdsaPublicKey, rawBody, signature, timestamp);
 
-      const result = eventWebhook.verifySignature(ecdsaPublicKey, rawBody, signature, timestamp);
-
-      return { success: result, message: 'Provider signature verification result' };
+      return isValid
+        ? { success: true, status: WebhookSignatureStatusEnum.VERIFIED, message: 'SendGrid signature verified' }
+        : { success: false, status: WebhookSignatureStatusEnum.INVALID, message: 'Invalid SendGrid signature' };
     } catch (error) {
-      return { success: false, message: `Error verifying signature: ${error.message}` };
+      return {
+        success: false,
+        status: WebhookSignatureStatusEnum.ERROR,
+        message: `Error verifying signature: ${error instanceof Error ? error.message : 'Unknown error'}`,
+      };
     }
   }
 
