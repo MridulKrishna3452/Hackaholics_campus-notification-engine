@@ -349,3 +349,12 @@ export type StandardNovuOptions = {
 export type NovuOptions = KeylessNovuOptions | StandardNovuOptions;
 
 export type Prettify<T> = { [K in keyof T]: T[K] } & {};
+
+export type FocusModeStatus = {
+  isActive: boolean;
+  sessionId?: string;
+  startedAt?: string;
+  endsAt?: string;
+  endedAt?: string;
+  remainingSeconds?: number;
+};

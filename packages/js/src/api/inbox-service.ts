@@ -20,6 +20,7 @@ import type {
   ChannelPreference,
   Context,
   DefaultSchedule,
+  FocusModeStatus,
   InboxNotification,
   NotificationFilter,
   PreferencesResponse,
@@ -260,6 +261,18 @@ export class InboxService {
 
   read(notificationId: string): Promise<InboxNotification> {
     return this.#httpClient.patch(`${INBOX_NOTIFICATIONS_ROUTE}/${notificationId}/read`);
+  }
+
+  getFocusMode(): Promise<FocusModeStatus> {
+    return this.#httpClient.get(`${INBOX_ROUTE}/focus-mode`);
+  }
+
+  startFocusMode(durationMinutes: number): Promise<FocusModeStatus> {
+    return this.#httpClient.post(`${INBOX_ROUTE}/focus-mode/start`, { durationMinutes });
+  }
+
+  endFocusMode(): Promise<FocusModeStatus> {
+    return this.#httpClient.post(`${INBOX_ROUTE}/focus-mode/end`);
   }
 
   unread(notificationId: string): Promise<InboxNotification> {
