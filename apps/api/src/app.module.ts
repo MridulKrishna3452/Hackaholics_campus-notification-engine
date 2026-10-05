@@ -32,6 +32,7 @@ import { FeedsModule } from './app/feeds/feeds.module';
 import { HealthModule } from './app/health/health.module';
 import { HumanModule } from './app/human/human.module';
 import { InboundParseModule } from './app/inbound-parse/inbound-parse.module';
+import { FocusModeModule } from './app/focus-mode/focus-mode.module';
 import { InboxModule } from './app/inbox/inbox.module';
 import { IntegrationModule } from './app/integrations/integrations.module';
 import { InternalModule } from './app/internal/internal.module';
@@ -131,6 +132,7 @@ const baseModules: Array<Type | DynamicModule | Promise<DynamicModule> | Forward
   EventsModule,
   WidgetsModule,
   InboxModule,
+  FocusModeModule,
   NotificationModule,
   NotificationGroupsModule,
   ContentTemplatesModule,
